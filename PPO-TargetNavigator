@@ -1,0 +1,379 @@
+"""
+Обучение PPO агента с использованием Stable Baselines3
+Кастомный Environment: агент учится достигать случайной цели на 2D плоскости
+
+Автор: Создано для исследования RL
+"""
+
+import gymnasium as gym
+from gymnasium import spaces
+import numpy as np
+from stable_baselines3 import PPO
+from stable_baselines3.common.env_checker import check_env
+from stable_baselines3.common.callbacks import BaseCallback
+import matplotlib.pyplot as plt
+from typing import Optional
+
+# ============================================================================
+# ШАБЛОН КАСТОМНОГО ENVIRONMENT
+# ============================================================================
+
+class SimpleTargetEnv(gym.Env):
+    """
+    Кастомное окружение для обучения агента достигать цели.
+    
+    Пространство состояний (observation_space):
+        - Позиция агента (x, y)
+        - Позиция цели (target_x, target_y)
+        - Всего: 4-мерный вектор
+    
+    Пространство действий (action_space):
+        - Непрерывные действия: изменение (dx, dy)
+        - Диапазон: [-1, 1] для каждого измерения
+    
+    Награда:
+        - Отрицательное расстояние до цели (чем ближе, тем лучше)
+        - Бонус +100 за достижение цели
+        - Штраф -0.01 за каждый шаг (стимул действовать быстро)
+    """
+    
+    metadata = {'render_modes': ['human']}
+    
+    def __init__(self, render_mode: Optional[str] = None):
+        super().__init__()
+        
+        # Определяем границы мира
+        self.world_size = 10.0  # Мир от -10 до +10 по каждой оси
+        self.max_steps = 200    # Максимум шагов в эпизоде
+        self.goal_threshold = 0.5  # Радиус достижения цели
+        
+        # Пространство наблюдений: [agent_x, agent_y, target_x, target_y]
+        # Все координаты в диапазоне [-world_size, world_size]
+        self.observation_space = spaces.Box(
+            low=-self.world_size,
+            high=self.world_size,
+            shape=(4,),  # 4 значения
+            dtype=np.float32
+        )
+        
+        # Пространство действий: [dx, dy] - непрерывные изменения позиции
+        # Ограничены в [-1, 1] для плавного движения
+        self.action_space = spaces.Box(
+            low=-1.0,
+            high=1.0,
+            shape=(2,),  # 2 значения
+            dtype=np.float32
+        )
+        
+        # Инициализация состояния
+        self.agent_pos = np.zeros(2, dtype=np.float32)
+        self.target_pos = np.zeros(2, dtype=np.float32)
+        self.current_step = 0
+        self.render_mode = render_mode
+        
+        # Для визуализации (если нужно)
+        self.fig = None
+        self.ax = None
+    
+    def reset(self, seed: Optional[int] = None, options: Optional[dict] = None):
+        """
+        Сброс окружения в начальное состояние.
+        Вызывается в начале каждого эпизода.
+        """
+        super().reset(seed=seed)
+        
+        # Случайная начальная позиция агента
+        self.agent_pos = self.np_random.uniform(
+            low=-self.world_size * 0.8,  # Немного внутри границ
+            high=self.world_size * 0.8,
+            size=2
+        ).astype(np.float32)
+        
+        # Случайная позиция цели (подальше от агента)
+        self.target_pos = self.np_random.uniform(
+            low=-self.world_size * 0.8,
+            high=self.world_size * 0.8,
+            size=2
+        ).astype(np.float32)
+        
+        # Убедимся, что цель не слишком близко к агенту
+        while np.linalg.norm(self.agent_pos - self.target_pos) < 2.0:
+            self.target_pos = self.np_random.uniform(
+                low=-self.world_size * 0.8,
+                high=self.world_size * 0.8,
+                size=2
+            ).astype(np.float32)
+        
+        self.current_step = 0
+        
+        # Формируем наблюдение: [agent_x, agent_y, target_x, target_y]
+        observation = np.concatenate([self.agent_pos, self.target_pos])
+        info = {'distance': np.linalg.norm(self.agent_pos - self.target_pos)}
+        
+        return observation, info
+    
+    def step(self, action):
+        """
+        Выполняет одно действие в окружении.
+        
+        Параметры:
+            action: np.array([dx, dy]) - изменение позиции агента
+        
+        Возвращает:
+            observation: новое состояние
+            reward: награда за действие
+            terminated: достигнута ли цель
+            truncated: превышен ли лимит шагов
+            info: дополнительная информация
+        """
+        # Применяем действие: обновляем позицию агента
+        # action уже в диапазоне [-1, 1], масштабируем для скорости движения
+        self.agent_pos += action * 0.5  # 0.5 - коэффициент скорости
+        
+        # Ограничиваем агента границами мира
+        self.agent_pos = np.clip(
+            self.agent_pos,
+            -self.world_size,
+            self.world_size
+        )
+        
+        # Вычисляем расстояние до цели
+        distance = np.linalg.norm(self.agent_pos - self.target_pos)
+        
+        # ===== ФУНКЦИЯ НАГРАДЫ =====
+        # 1. Базовая награда: отрицательное расстояние (стимул приближаться)
+        reward = -distance
+        
+        # 2. Штраф за каждый шаг (стимул двигаться быстро)
+        reward -= 0.01
+        
+        # 3. Бонус за достижение цели
+        terminated = False
+        if distance < self.goal_threshold:
+            reward += 100.0  # Большой бонус!
+            terminated = True
+        
+        # КРИТИЧНО: Конвертируем reward в Python float (Gymnasium требует!)
+        reward = float(reward)
+        
+        # Проверяем лимит шагов
+        self.current_step += 1
+        truncated = self.current_step >= self.max_steps
+        
+        # Формируем новое наблюдение
+        observation = np.concatenate([self.agent_pos, self.target_pos])
+        
+        # Дополнительная информация для анализа
+        info = {
+            'distance': distance,
+            'steps': self.current_step,
+            'success': terminated
+        }
+        
+        return observation, reward, terminated, truncated, info
+    
+    def render(self):
+        """Визуализация текущего состояния (опционально)"""
+        if self.render_mode == 'human':
+            if self.fig is None:
+                plt.ion()
+                self.fig, self.ax = plt.subplots(figsize=(8, 8))
+            
+            self.ax.clear()
+            self.ax.set_xlim(-self.world_size, self.world_size)
+            self.ax.set_ylim(-self.world_size, self.world_size)
+            self.ax.set_aspect('equal')
+            self.ax.grid(True, alpha=0.3)
+            
+            # Рисуем цель
+            circle = plt.Circle(self.target_pos, self.goal_threshold, 
+                               color='green', alpha=0.3, label='Цель')
+            self.ax.add_patch(circle)
+            self.ax.plot(self.target_pos[0], self.target_pos[1], 
+                        'g*', markersize=20, label='Цель')
+            
+            # Рисуем агента
+            self.ax.plot(self.agent_pos[0], self.agent_pos[1], 
+                        'bo', markersize=15, label='Агент')
+            
+            # Рисуем линию до цели
+            self.ax.plot([self.agent_pos[0], self.target_pos[0]],
+                        [self.agent_pos[1], self.target_pos[1]],
+                        'r--', alpha=0.5, linewidth=2)
+            
+            distance = np.linalg.norm(self.agent_pos - self.target_pos)
+            self.ax.set_title(f'Шаг: {self.current_step}, Расстояние: {distance:.2f}')
+            self.ax.legend()
+            
+            plt.draw()
+            plt.pause(0.01)
+    
+    def close(self):
+        """Закрытие окружения"""
+        if self.fig is not None:
+            plt.close(self.fig)
+
+
+# ============================================================================
+# CALLBACK ДЛЯ МОНИТОРИНГА ОБУЧЕНИЯ
+# ============================================================================
+
+class TrainingMonitorCallback(BaseCallback):
+    """
+    Callback для отслеживания прогресса обучения.
+    Собирает статистику и выводит её каждые N шагов.
+    """
+    def __init__(self, check_freq: int = 1000, verbose: int = 1):
+        super().__init__(verbose)
+        self.check_freq = check_freq
+        self.episode_rewards = []
+        self.episode_lengths = []
+        self.success_rate = []
+    
+    def _on_step(self) -> bool:
+        """
+        Вызывается после каждого шага в окружении.
+        Возвращает True для продолжения обучения.
+        """
+        # Собираем статистику из буфера
+        if len(self.model.ep_info_buffer) > 0:
+            # ep_info_buffer содержит информацию о завершённых эпизодах
+            for ep_info in self.model.ep_info_buffer:
+                self.episode_rewards.append(ep_info['r'])
+                self.episode_lengths.append(ep_info['l'])
+        
+        # Выводим статистику каждые check_freq шагов
+        if self.n_calls % self.check_freq == 0:
+            if len(self.episode_rewards) > 0:
+                mean_reward = np.mean(self.episode_rewards[-100:])
+                mean_length = np.mean(self.episode_lengths[-100:])
+                
+                print(f"\n{'='*60}")
+                print(f"Шагов обучения: {self.n_calls}")
+                print(f"Средняя награда (последние 100 эпизодов): {mean_reward:.2f}")
+                print(f"Средняя длина эпизода: {mean_length:.1f}")
+                print(f"Всего эпизодов: {len(self.episode_rewards)}")
+                print(f"{'='*60}\n")
+        
+        return True  # Продолжаем обучение
+
+
+# ============================================================================
+# ОСНОВНОЙ КОД: СОЗДАНИЕ, ПРОВЕРКА, ОБУЧЕНИЕ
+# ============================================================================
+
+def main():
+    """Главная функция для запуска обучения"""
+    
+    print("🚀 Начинаем обучение PPO агента!\n")
+    
+    # ===== ШАГ 1: СОЗДАНИЕ ОКРУЖЕНИЯ =====
+    print("📦 Создаём кастомное окружение...")
+    env = SimpleTargetEnv()
+    
+    # ===== ШАГ 2: ПРОВЕРКА ОКРУЖЕНИЯ =====
+    # Stable Baselines3 требует, чтобы окружение соответствовало стандарту Gym
+    print("🔍 Проверяем окружение на корректность...")
+    try:
+        check_env(env, warn=True)
+        print("✅ Окружение корректно!\n")
+    except Exception as e:
+        print(f"❌ Ошибка в окружении: {e}")
+        return
+    
+    # ===== ШАГ 3: СОЗДАНИЕ PPO МОДЕЛИ =====
+    print("🧠 Создаём PPO модель...")
+    
+    # Гиперпараметры PPO
+    model = PPO(
+        policy="MlpPolicy",          # Многослойный перцептрон (полносвязная сеть)
+        env=env,                     # Наше окружение
+        learning_rate=3e-4,          # Скорость обучения (α)
+        n_steps=2048,                # Шагов на rollout (сбор данных)
+        batch_size=64,               # Размер мини-батча для обновления
+        n_epochs=10,                 # Эпох обновления на rollout
+        gamma=0.99,                  # Коэффициент дисконтирования (γ)
+        gae_lambda=0.95,             # λ для GAE (Generalized Advantage Estimation)
+        clip_range=0.2,              # Клип-параметр (ε)
+        ent_coef=0.0,                # Коэффициент энтропии (исследование)
+        vf_coef=0.5,                 # Коэффициент value function
+        max_grad_norm=0.5,           # Максимальная норма градиента
+        verbose=1,                   # Вывод информации
+        tensorboard_log=None         # Отключаем TensorBoard (можно установить позже)
+    )
+    
+    print("✅ Модель создана!")
+    print(f"   - Архитектура политики: {model.policy}")
+    print(f"   - Общее количество параметров: ~{sum(p.numel() for p in model.policy.parameters()):,}")
+    print()
+    
+    # ===== ШАГ 4: ОБУЧЕНИЕ =====
+    print("🎓 Начинаем обучение...")
+    print("   (Это займёт несколько минут)\n")
+    
+    # Создаём callback для мониторинга
+    callback = TrainingMonitorCallback(check_freq=5000)
+    
+    # ОБУЧЕНИЕ!
+    total_timesteps = 100_000  # Общее количество шагов обучения
+    model.learn(
+        total_timesteps=total_timesteps,
+        callback=callback,
+        progress_bar=True  # Прогресс-бар
+    )
+    
+    print("\n✅ Обучение завершено!")
+    
+    # ===== ШАГ 5: СОХРАНЕНИЕ МОДЕЛИ =====
+    model_path = "./ppo_target_model"
+    model.save(model_path)
+    print(f"💾 Модель сохранена в: {model_path}")
+    
+    # ===== ШАГ 6: ТЕСТИРОВАНИЕ ОБУЧЕННОГО АГЕНТА =====
+    print("\n🎮 Тестируем обученного агента...\n")
+    
+    # Создаём новое окружение для теста
+    test_env = SimpleTargetEnv()
+    
+    # Загружаем модель (демонстрация загрузки)
+    # model = PPO.load(model_path, env=test_env)
+    
+    # Запускаем 5 тестовых эпизодов
+    num_test_episodes = 5
+    for episode in range(num_test_episodes):
+        obs, info = test_env.reset()
+        episode_reward = 0
+        done = False
+        steps = 0
+        
+        print(f"Эпизод {episode + 1}:")
+        print(f"  Начальная позиция агента: ({obs[0]:.2f}, {obs[1]:.2f})")
+        print(f"  Позиция цели: ({obs[2]:.2f}, {obs[3]:.2f})")
+        print(f"  Начальное расстояние: {info['distance']:.2f}")
+        
+        while not done and steps < test_env.max_steps:
+            # Предсказываем действие (deterministic=True для стабильности)
+            action, _states = model.predict(obs, deterministic=True)
+            
+            # Выполняем действие
+            obs, reward, terminated, truncated, info = test_env.step(action)
+            done = terminated or truncated
+            
+            episode_reward += reward
+            steps += 1
+        
+        print(f"  Результат: {'✅ УСПЕХ!' if info['success'] else '❌ Не достиг'}")
+        print(f"  Финальное расстояние: {info['distance']:.2f}")
+        print(f"  Шагов потрачено: {steps}")
+        print(f"  Общая награда: {episode_reward:.2f}\n")
+    
+    test_env.close()
+    
+    print("🎉 Всё готово! Ты можешь:")
+    print("   1. Загрузить модель: PPO.load('./ppo_target_model')")
+    print("   2. Модифицировать окружение для своих задач!")
+    print("   3. Установить TensorBoard для визуализации: pip install tensorboard")
+
+
+if __name__ == "__main__":
+    main()
